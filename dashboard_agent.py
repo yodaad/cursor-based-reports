@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Dashboard Agent — Config-driven Salesforce report dashboard generator.
-Interactive version with client-side filtering.
+Interactive version with client-side filtering and live Salesforce connection.
 Command Alkon | Digital Engagement | 2026
 """
 
 import argparse
 import json
 import re
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from pathlib import Path
 BRAND_NAVY = "#002856"
 BRAND_ORANGE = "#DF4E10"
 REFERENCE_HTML = r"C:\Users\daarango\Documents\Command Alkon\src\su_implementation_and_adoption_report.html"
+SF_ORG_ALIAS = "prod"  # Your Salesforce org alias
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -28,14 +31,22 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # From local JSON file (default)
   python dashboard_agent.py --config configs/published_articles.json
-  python dashboard_agent.py --config configs/published_articles.json --output my_report.html
-  python dashboard_agent.py --config configs/published_articles.json --template executive
+
+  # Live from Salesforce (pulls fresh data)
+  python dashboard_agent.py --config configs/published_articles.json --live
+
+  # Live with custom output name
+  python dashboard_agent.py --config configs/published_articles.json --live --output weekly_report.html
         """
     )
     parser.add_argument("--config", required=True, help="Path to report config JSON file")
+    parser.add_argument("--live", action="store_true", help="Pull fresh data from Salesforce (requires sf CLI authenticated)")
+    parser.add_argument("--discover", action="store_true", help="Show auto-detected columns from Salesforce and exit (requires --live)")
     parser.add_argument("--template", default=None, help="Template: executive (default from config)")
     parser.add_argument("--output", default=None, help="Output HTML filename (auto-generated if not provided)")
+    parser.add_argument("--save-data", action="store_true", help="When using --live, also save the parsed data to JSON file")
     return parser.parse_args()
 
 
@@ -48,12 +59,144 @@ def load_config(config_path):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADER (no filtering - all data goes to the HTML)
+# SALESFORCE LIVE DATA PULL
 # ══════════════════════════════════════════════════════════════════════════════
-def load_data(config):
-    input_file = config.get("input_file", "articles_clean.json")
-    with open(input_file, encoding="utf-8") as f:
-        return json.load(f)
+def pull_salesforce_report(report_id):
+    """Pull report data from Salesforce using sf CLI."""
+    print(f"Pulling report {report_id} from Salesforce...")
+    
+    endpoint = f"/services/data/v62.0/analytics/reports/{report_id}"
+    cmd = [
+        "sf", "api", "request", "rest", endpoint,
+        "--target-org", SF_ORG_ALIAS
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=True,  # Required for Windows to find sf.cmd
+            timeout=120
+        )
+        
+        if result.returncode != 0:
+            print(f"ERROR: Salesforce CLI returned error:")
+            print(result.stderr)
+            sys.exit(1)
+        
+        return json.loads(result.stdout)
+    
+    except subprocess.TimeoutExpired:
+        print("ERROR: Salesforce request timed out after 120 seconds.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Could not parse Salesforce response as JSON: {e}")
+        print(f"Response was: {result.stdout[:500]}...")
+        sys.exit(1)
+    except FileNotFoundError:
+        print("ERROR: 'sf' command not found. Make sure Salesforce CLI is installed and in your PATH.")
+        sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COLUMN AUTO-DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+def normalize_column_name(sf_column):
+    """Convert a Salesforce API column name to clean snake_case.
+    
+    Examples:
+      Knowledge__kav.Language          -> language
+      Knowledge__ka.LastPublishedDate  -> last_published_date
+      Knowledge__kav.Product__c        -> product
+      Knowledge__kav.LastModifiedBy.Name -> last_modified_by_name
+    """
+    parts = sf_column.split(".")
+    # Drop the object prefix (e.g. "Knowledge__kav"), keep the rest
+    if len(parts) > 1:
+        name = "_".join(parts[1:])
+    else:
+        name = parts[0]
+
+    # Remove Salesforce custom field suffixes (__c, __r)
+    name = re.sub(r'__[crC R]$', '', name)
+    name = re.sub(r'__c$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'__r$', '', name, flags=re.IGNORECASE)
+
+    # CamelCase → snake_case
+    name = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+    name = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', name)
+    name = name.lower()
+
+    # Collapse multiple underscores, strip edges
+    name = re.sub(r'_+', '_', name)
+    name = name.strip('_')
+
+    return name
+
+
+def auto_detect_columns(raw_data):
+    """Build a {index: field_name} mapping from Salesforce report metadata."""
+    detail_columns = raw_data.get("reportMetadata", {}).get("detailColumns", [])
+    mapping = {idx: normalize_column_name(col) for idx, col in enumerate(detail_columns)}
+    return mapping, detail_columns
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARSE SALESFORCE REPORT RESPONSE
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_report_response(raw_data):
+    """Parse Salesforce Analytics API response using auto-detected columns."""
+    mapping, detail_columns = auto_detect_columns(raw_data)
+    date_keywords = {"date", "datetime", "time"}
+
+    rows = raw_data.get("factMap", {}).get("T!T", {}).get("rows", [])
+
+    records = []
+    for row in rows:
+        cells = row.get("dataCells", [])
+        record = {}
+        for idx, field_name in mapping.items():
+            if idx < len(cells):
+                cell = cells[idx]
+                # Date fields: use ISO value; all others: use display label
+                is_date = any(kw in field_name for kw in date_keywords)
+                record[field_name] = cell.get("value", "") if is_date else cell.get("label", "")
+        records.append(record)
+
+    return records, mapping
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA LOADER (from file or live)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_data(config, live=False, save_data=False):
+    if live:
+        report_id = config.get("report_id")
+        if not report_id:
+            print("ERROR: Config file must include 'report_id' to use --live mode.")
+            sys.exit(1)
+        
+        raw_data = pull_salesforce_report(report_id)
+        data, mapping = parse_report_response(raw_data)
+        print(f"Pulled {len(data)} records from Salesforce.")
+        print(f"Auto-detected {len(mapping)} columns: {', '.join(mapping.values())}")
+        
+        # Optionally save to file
+        if save_data:
+            output_file = config.get("input_file", "articles_clean.json")
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"Saved data to {output_file}")
+        
+        return data
+    else:
+        input_file = config.get("input_file", "articles_clean.json")
+        print(f"Loading data from {input_file}...")
+        with open(input_file, encoding="utf-8") as f:
+            return json.load(f)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -520,9 +663,25 @@ def main():
     # Load config
     config = load_config(args.config)
     print(f"Loaded config: {config.get('name', 'Unknown')}")
-    
-    # Load all data (no filtering - filters happen in browser)
-    data = load_data(config)
+
+    # Discover mode: show auto-detected columns and exit
+    if args.discover:
+        if not args.live:
+            print("ERROR: --discover requires --live (needs to pull from Salesforce to read metadata).")
+            sys.exit(1)
+        report_id = config.get("report_id")
+        raw_data = pull_salesforce_report(report_id)
+        mapping, detail_columns = auto_detect_columns(raw_data)
+        print(f"\nAuto-detected {len(mapping)} columns for report: {config.get('name')}\n")
+        print(f"  {'Index':<6} {'Salesforce Column':<45} {'Auto Field Name'}")
+        print(f"  {'-'*6} {'-'*45} {'-'*30}")
+        for idx, sf_col in enumerate(detail_columns):
+            print(f"  {idx:<6} {sf_col:<45} {mapping[idx]}")
+        print(f"\nUse these field names in your config for 'date_field' and 'charts.group_by'.")
+        return
+
+    # Load data (from file or live from Salesforce)
+    data = load_data(config, live=args.live, save_data=args.save_data)
     print(f"Total records: {len(data)}")
     
     # Determine template
@@ -543,7 +702,6 @@ def main():
         f.write(html)
     
     print(f"Interactive dashboard generated: {output}")
-    print(f"Open in browser and use the filter controls to explore the data.")
 
 
 if __name__ == "__main__":

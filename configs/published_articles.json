@@ -1,27 +1,19 @@
 {
-    "name": "Published Articles",
-    "description": "Knowledge base articles from Salesforce",
-    "report_id": "00ORc0000079DwTMAU",
-    "input_file": "articles_clean.json",
-    "date_field": "published_date",
-    "category_fields": ["product", "language"],
-    "label_field": "title",
-    "default_template": "executive",
-    "charts": {
-      "primary": {
-        "type": "bar",
-        "group_by": "product",
-        "title": "Articles by Product"
-      },
-      "secondary": {
-        "type": "doughnut",
-        "group_by": "language",
-        "title": "Articles by Language"
-      }
+  "name": "Published Articles",
+  "report_id": "00ORc0000079DwTMAU",
+  "input_file": "articles_clean.json",
+  "date_field": "last_published_date",
+  "default_template": "executive",
+  "charts": {
+    "primary": {
+      "type": "bar",
+      "group_by": "product",
+      "title": "Articles by Product"
     },
-    "kpi_cards": [
-      {"label": "Total Articles", "value": "total"},
-      {"label": "Top Product", "value": "top_category_product"},
-      {"label": "Languages", "value": "unique_count_language"}
-    ]
+    "secondary": {
+      "type": "doughnut",
+      "group_by": "language",
+      "title": "Articles by Language"
+    }
   }
+}
